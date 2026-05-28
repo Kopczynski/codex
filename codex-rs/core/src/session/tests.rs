@@ -103,9 +103,9 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::CreditsSnapshot;
@@ -397,6 +397,12 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     ));
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let marker_evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn aborted marker event")
+        .expect("channel open");
+    assert!(matches!(marker_evt.msg, EventMsg::RawResponseItem(_)));
 
     let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
@@ -1772,7 +1778,7 @@ async fn recompute_token_usage_uses_session_base_instructions() {
 
     let item = user_message("hello");
     session
-        .record_into_history(std::slice::from_ref(&item), &turn_context)
+        .record_conversation_items(&turn_context, std::slice::from_ref(&item))
         .await;
 
     let history = session.clone_history().await;
@@ -2032,6 +2038,85 @@ async fn turn_start_lifecycle_exposes_turn_metadata_and_token_baseline() {
     let actual = records
         .lock()
         .expect("turn start records lock")
+        .drain(..)
+        .collect::<Vec<_>>();
+    assert_eq!(vec![expected], actual);
+}
+
+#[tokio::test]
+async fn turn_error_lifecycle_exposes_error_and_stores() {
+    struct SessionTurnErrorMarker;
+    struct ThreadTurnErrorMarker;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedTurnError {
+        session_level_id: String,
+        thread_level_id: String,
+        turn_level_id: String,
+        turn_id: String,
+        error: CodexErrorInfo,
+        saw_session_store: bool,
+        saw_thread_store: bool,
+    }
+
+    struct TurnErrorRecorder {
+        records: Arc<std::sync::Mutex<Vec<RecordedTurnError>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl codex_extension_api::TurnLifecycleContributor for TurnErrorRecorder {
+        async fn on_turn_error(&self, input: codex_extension_api::TurnErrorInput<'_>) {
+            self.records
+                .lock()
+                .expect("turn error records lock")
+                .push(RecordedTurnError {
+                    session_level_id: input.session_store.level_id().to_string(),
+                    thread_level_id: input.thread_store.level_id().to_string(),
+                    turn_level_id: input.turn_store.level_id().to_string(),
+                    turn_id: input.turn_id.to_string(),
+                    error: input.error,
+                    saw_session_store: input
+                        .session_store
+                        .get::<SessionTurnErrorMarker>()
+                        .is_some(),
+                    saw_thread_store: input.thread_store.get::<ThreadTurnErrorMarker>().is_some(),
+                });
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_lifecycle_contributor(Arc::new(TurnErrorRecorder {
+        records: Arc::clone(&records),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    session
+        .services
+        .session_extension_data
+        .insert(SessionTurnErrorMarker);
+    session
+        .services
+        .thread_extension_data
+        .insert(ThreadTurnErrorMarker);
+
+    let expected = RecordedTurnError {
+        session_level_id: session.session_id().to_string(),
+        thread_level_id: session.conversation_id.to_string(),
+        turn_level_id: turn_context.sub_id.clone(),
+        turn_id: turn_context.sub_id.clone(),
+        error: CodexErrorInfo::UsageLimitExceeded,
+        saw_session_store: true,
+        saw_thread_store: true,
+    };
+
+    session
+        .emit_turn_error_lifecycle(&turn_context, CodexErrorInfo::UsageLimitExceeded)
+        .await;
+
+    let actual = records
+        .lock()
+        .expect("turn error records lock")
         .drain(..)
         .collect::<Vec<_>>();
     assert_eq!(vec![expected], actual);
@@ -2547,7 +2632,7 @@ async fn thread_rollback_fails_without_persisted_thread_history() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
     let initial_context = sess.build_initial_context(tc.as_ref()).await;
-    sess.record_into_history(&initial_context, tc.as_ref())
+    sess.record_conversation_items(tc.as_ref(), &initial_context)
         .await;
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
@@ -2920,7 +3005,7 @@ async fn thread_rollback_fails_when_turn_in_progress() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
     let initial_context = sess.build_initial_context(tc.as_ref()).await;
-    sess.record_into_history(&initial_context, tc.as_ref())
+    sess.record_conversation_items(tc.as_ref(), &initial_context)
         .await;
 
     *sess.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
@@ -2941,7 +3026,7 @@ async fn thread_rollback_fails_when_num_turns_is_zero() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
     let initial_context = sess.build_initial_context(tc.as_ref()).await;
-    sess.record_into_history(&initial_context, tc.as_ref())
+    sess.record_conversation_items(tc.as_ref(), &initial_context)
         .await;
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 0).await;
@@ -7531,7 +7616,7 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
         phase: None,
     };
     session
-        .record_into_history(std::slice::from_ref(&compacted_summary), &turn_context)
+        .record_conversation_items(&turn_context, std::slice::from_ref(&compacted_summary))
         .await;
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
@@ -7962,7 +8047,7 @@ async fn guardian_helper_review_interrupts_after_three_consecutive_denials() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_log::test]
-async fn abort_regular_task_emits_turn_aborted_only() {
+async fn abort_regular_task_emits_marker_before_turn_aborted() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let input = vec![TurnInput::UserInput(vec![UserInput::Text {
         text: "hello".to_string(),
@@ -7980,8 +8065,13 @@ async fn abort_regular_task_emits_turn_aborted_only() {
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
-    // Interrupts persist a model-visible `<turn_aborted>` marker into history, but there is no
-    // separate client-visible event for that marker (only `EventMsg::TurnAborted`).
+    // Interrupts surface the model-visible `<turn_aborted>` marker before the abort event.
+    let marker_evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for marker event")
+        .expect("event");
+    assert!(matches!(marker_evt.msg, EventMsg::RawResponseItem(_)));
+
     let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
         .expect("timeout waiting for event")
@@ -7995,7 +8085,7 @@ async fn abort_regular_task_emits_turn_aborted_only() {
 }
 
 #[tokio::test]
-async fn abort_gracefully_emits_turn_aborted_only() {
+async fn abort_gracefully_emits_marker_before_turn_aborted() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let input = vec![TurnInput::UserInput(vec![UserInput::Text {
         text: "hello".to_string(),
@@ -8013,8 +8103,13 @@ async fn abort_gracefully_emits_turn_aborted_only() {
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
-    // Even if tasks handle cancellation gracefully, interrupts still result in `TurnAborted`
-    // being the only client-visible signal.
+    // Gracefully cancelled tasks surface the model-visible marker before the abort event too.
+    let marker_evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for marker event")
+        .expect("event");
+    assert!(matches!(marker_evt.msg, EventMsg::RawResponseItem(_)));
+
     let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
         .expect("timeout waiting for event")
@@ -8284,65 +8379,10 @@ async fn steer_input_returns_active_turn_id() {
 }
 
 #[tokio::test]
-async fn queued_response_items_for_next_turn_move_into_next_active_turn() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    let queued_item = ResponseInputItem::Message {
-        role: "assistant".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "queued before wake".to_string(),
-        }],
-        phase: None,
-    };
-
-    sess.input_queue
-        .queue_response_items_for_next_turn(vec![queued_item.clone()])
-        .await;
-
-    sess.spawn_task(
-        Arc::clone(&tc),
-        Vec::new(),
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
-        },
-    )
-    .await;
-
-    assert_eq!(
-        sess.input_queue.get_pending_input(&sess.active_turn).await,
-        vec![TurnInput::ResponseInputItem(queued_item)]
-    );
-}
-
-#[tokio::test]
-async fn idle_interrupt_does_not_wake_queued_next_turn_items() {
-    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-    let queued_item = ResponseInputItem::Message {
-        role: "assistant".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "queued before interrupt".to_string(),
-        }],
-        phase: None,
-    };
-
-    sess.input_queue
-        .queue_response_items_for_next_turn(vec![queued_item])
-        .await;
-
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-
-    assert!(sess.active_turn.lock().await.is_none());
-    assert!(
-        sess.input_queue
-            .has_queued_response_items_for_next_turn()
-            .await
-    );
-}
-
-#[tokio::test]
 async fn abort_empty_active_turn_preserves_pending_input() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-    let pending_item = ResponseInputItem::Message {
+    let pending_item = ResponseItem::Message {
+        id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
             text: "late pending input".to_string(),
@@ -8357,7 +8397,7 @@ async fn abort_empty_active_turn_preserves_pending_input() {
     sess.input_queue
         .extend_pending_input_for_turn_state(
             turn_state.as_ref(),
-            vec![TurnInput::ResponseInputItem(pending_item.clone())],
+            vec![TurnInput::ResponseItem(pending_item.clone())],
         )
         .await;
 
@@ -8368,7 +8408,7 @@ async fn abort_empty_active_turn_preserves_pending_input() {
         sess.input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await,
-        vec![TurnInput::ResponseInputItem(pending_item)]
+        vec![TurnInput::ResponseItem(pending_item)]
     );
 }
 
@@ -8794,7 +8834,7 @@ async fn budget_limited_accounting_steers_active_turn_without_aborting() -> anyh
     .await?;
 
     let pending_input = sess.input_queue.get_pending_input(&sess.active_turn).await;
-    let [TurnInput::ResponseInputItem(ResponseInputItem::Message { role, content, .. })] =
+    let [TurnInput::ResponseItem(ResponseItem::Message { role, content, .. })] =
         pending_input.as_slice()
     else {
         panic!("expected one budget-limit steering message, got {pending_input:#?}");
@@ -9021,7 +9061,7 @@ async fn external_objective_change_steers_active_turn() -> anyhow::Result<()> {
         pending_input.iter().any(|item| {
             matches!(
                 item,
-                TurnInput::ResponseInputItem(ResponseInputItem::Message { role, content, .. })
+                TurnInput::ResponseItem(ResponseItem::Message { role, content, .. })
                     if role == "user"
                         && content.iter().any(|content| matches!(
                             content,
@@ -9245,9 +9285,9 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
 
     assert_eq!(
         sess.input_queue.get_pending_input(&sess.active_turn).await,
-        vec![TurnInput::ResponseInputItem(
+        vec![TurnInput::ResponseItem(ResponseItem::from(
             communication.to_response_input_item()
-        )],
+        ))],
     );
 }
 
@@ -9332,7 +9372,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
                 text: "follow up".to_string(),
                 text_elements: Vec::new(),
             }]),
-            TurnInput::ResponseInputItem(communication.to_response_input_item()),
+            TurnInput::ResponseItem(ResponseItem::from(communication.to_response_input_item())),
         ],
     );
 }
@@ -9386,7 +9426,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
                 text: "follow up".to_string(),
                 text_elements: Vec::new(),
             }]),
-            TurnInput::ResponseInputItem(communication.to_response_input_item()),
+            TurnInput::ResponseItem(ResponseItem::from(communication.to_response_input_item())),
         ],
     );
 }
@@ -9441,9 +9481,9 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     assert!(output.tool_future.is_some());
     assert_eq!(
         sess.input_queue.get_pending_input(&sess.active_turn).await,
-        vec![TurnInput::ResponseInputItem(
+        vec![TurnInput::ResponseItem(ResponseItem::from(
             communication.to_response_input_item()
-        )],
+        ))],
     );
 }
 
@@ -9501,8 +9541,7 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
     );
 
     let history = sess.clone_history().await;
-    // The `<turn_aborted>` marker is silent in the event stream, so verify it is still
-    // recorded in history for the model.
+    // Verify the `<turn_aborted>` marker is still recorded in history for the model.
     assert!(
         history.raw_items().iter().any(|item| {
             let ResponseItem::Message { role, content, .. } = item else {
